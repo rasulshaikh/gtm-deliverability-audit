@@ -1,0 +1,183 @@
+{
+  "name": "GTM - Weekly Deliverability Audit",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 9 * * 1" }]
+        }
+      },
+      "id": "cron-monday",
+      "name": "Every Monday 9am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://server.smartlead.ai/api/v1/email-accounts?api_key={{ $env.SMARTLEAD_API_KEY }}&offset=0&limit=100",
+        "options": {}
+      },
+      "id": "fetch-inboxes",
+      "name": "Fetch Smartlead Inboxes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const inboxes = Array.isArray($input.first().json) ? $input.first().json : [];\nconst domains = [...new Set(inboxes.map(i => (i.from_email || i.email || '').split('@')[1]).filter(Boolean))];\nconst blocked = inboxes.filter(i => !i.is_smtp_success || i.warmup_details?.is_warmup_blocked);\n\nreturn domains.map(domain => ({\n  json: {\n    domain,\n    inbox_count: inboxes.filter(i => (i.from_email || i.email || '').endsWith('@' + domain)).length,\n    blocked_count: inboxes.filter(i => (i.from_email || i.email || '').endsWith('@' + domain) && (!i.is_smtp_success || i.warmup_details?.is_warmup_blocked)).length\n  }\n}));"
+      },
+      "id": "extract-domains",
+      "name": "Extract Unique Domains",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://dns.google/resolve?name={{ $json.domain }}&type=TXT",
+        "options": {}
+      },
+      "id": "check-spf",
+      "name": "Check SPF (DNS)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 200]
+    },
+    {
+      "parameters": {
+        "url": "=https://dns.google/resolve?name=_dmarc.{{ $('Extract Unique Domains').item.json.domain }}&type=TXT",
+        "options": {}
+      },
+      "id": "check-dmarc",
+      "name": "Check DMARC (DNS)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const domain = $('Extract Unique Domains').item.json;\nconst spf = $('Check SPF (DNS)').item.json;\nconst dmarc = $('Check DMARC (DNS)').item.json;\n\nfunction hasTxt(records, needle) {\n  const answers = records?.Answer || [];\n  return answers.some(a => (a.data || '').includes(needle));\n}\n\nconst spfOk = hasTxt(spf, 'v=spf1');\nconst dmarcOk = hasTxt(dmarc, 'v=DMARC1');\nlet score = 100;\nif (!spfOk) score -= 40;\nif (!dmarcOk) score -= 30;\n\nconst issues = [];\nif (!spfOk) issues.push('SPF missing');\nif (!dmarcOk) issues.push('DMARC missing');\nif (domain.blocked_count > 0) issues.push(domain.blocked_count + ' blocked inboxes');\n\nreturn [{\n  json: {\n    domain: domain.domain,\n    inbox_count: domain.inbox_count,\n    spf_present: spfOk,\n    dmarc_present: dmarcOk,\n    auth_score: score,\n    issues: issues.join('; ') || 'OK',\n    flag: score < 80 || domain.blocked_count > 0\n  }\n}];"
+      },
+      "id": "score-domain",
+      "name": "Score Domain Auth",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://server.smartlead.ai/api/v1/campaigns?api_key={{ $env.SMARTLEAD_API_KEY }}",
+        "options": {}
+      },
+      "id": "fetch-campaigns",
+      "name": "Fetch Campaigns",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const campaigns = Array.isArray($input.first().json) ? $input.first().json : [];\nconst active = campaigns.filter(c => ['ACTIVE','PAUSED','COMPLETED'].includes(c.status));\nreturn active.map(c => ({ json: { campaign_id: c.id, campaign_name: c.name, status: c.status } }));"
+      },
+      "id": "filter-campaigns",
+      "name": "Filter Active Campaigns",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 520]
+    },
+    {
+      "parameters": {
+        "url": "=https://server.smartlead.ai/api/v1/campaigns/{{ $json.campaign_id }}/analytics?api_key={{ $env.SMARTLEAD_API_KEY }}",
+        "options": {}
+      },
+      "id": "campaign-analytics",
+      "name": "Campaign Analytics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [660, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const meta = $('Filter Active Campaigns').item.json;\nconst stats = $input.first().json;\nconst sent = parseInt(stats.sent_count || stats.total_sent || 0);\nconst replies = parseInt(stats.reply_count || stats.total_replied || 0);\nconst replyRate = sent > 0 ? Math.round((replies / sent) * 10000) / 100 : 0;\nconst flag = sent >= 200 && replyRate < 1.0;\nreturn [{ json: {\n  campaign_name: meta.campaign_name,\n  sent, replies, reply_rate_pct: replyRate,\n  flag_low_reply: flag,\n  message: flag ? `BELOW 1% RULE: ${replyRate}% reply after ${sent} sends` : 'OK'\n}}];"
+      },
+      "id": "check-1pct-rule",
+      "name": "Check 1% Reply Rule",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const domainIssues = $('Score Domain Auth').all().filter(i => i.json.flag);\nconst campaignIssues = $('Check 1% Reply Rule').all().filter(i => i.json.flag_low_reply);\n\nconst lines = ['*Weekly Deliverability Audit*', ''];\nlines.push(`Domain issues: ${domainIssues.length}`);\ndomainIssues.forEach(i => lines.push(`- ${i.json.domain}: ${i.json.issues} (score ${i.json.auth_score})`));\nlines.push('');\nlines.push(`Campaigns below 1% rule: ${campaignIssues.length}`);\ncampaignIssues.forEach(i => lines.push(`- ${i.json.campaign_name}: ${i.json.reply_rate_pct}% (${i.json.sent} sent)`));\n\nif (domainIssues.length === 0 && campaignIssues.length === 0) {\n  lines.push('', 'All clear. No action needed.');\n}\n\nreturn [{ json: { slack_text: lines.join('\\n'), domain_issues: domainIssues.length, campaign_issues: campaignIssues.length } }];"
+      },
+      "id": "build-report",
+      "name": "Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 400]
+    },
+    {
+      "parameters": {
+        "channel": "={{ $env.SLACK_DELIVERABILITY_CHANNEL || '#gtm-alerts' }}",
+        "text": "={{ $json.slack_text }}",
+        "otherOptions": {}
+      },
+      "id": "slack-alert",
+      "name": "Post to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1320, 400],
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_CREDENTIALS_ID",
+          "name": "Slack API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every Monday 9am": {
+      "main": [[
+        { "node": "Fetch Smartlead Inboxes", "type": "main", "index": 0 },
+        { "node": "Fetch Campaigns", "type": "main", "index": 0 }
+      ]]
+    },
+    "Fetch Smartlead Inboxes": {
+      "main": [[{ "node": "Extract Unique Domains", "type": "main", "index": 0 }]]
+    },
+    "Extract Unique Domains": {
+      "main": [[
+        { "node": "Check SPF (DNS)", "type": "main", "index": 0 },
+        { "node": "Check DMARC (DNS)", "type": "main", "index": 0 }
+      ]]
+    },
+    "Check SPF (DNS)": {
+      "main": [[{ "node": "Score Domain Auth", "type": "main", "index": 0 }]]
+    },
+    "Check DMARC (DNS)": {
+      "main": [[{ "node": "Score Domain Auth", "type": "main", "index": 0 }]]
+    },
+    "Fetch Campaigns": {
+      "main": [[{ "node": "Filter Active Campaigns", "type": "main", "index": 0 }]]
+    },
+    "Filter Active Campaigns": {
+      "main": [[{ "node": "Campaign Analytics", "type": "main", "index": 0 }]]
+    },
+    "Campaign Analytics": {
+      "main": [[{ "node": "Check 1% Reply Rule", "type": "main", "index": 0 }]]
+    },
+    "Score Domain Auth": {
+      "main": [[{ "node": "Build Report", "type": "main", "index": 0 }]]
+    },
+    "Check 1% Reply Rule": {
+      "main": [[{ "node": "Build Report", "type": "main", "index": 0 }]]
+    },
+    "Build Report": {
+      "main": [[{ "node": "Post to Slack", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": [{ "name": "gtm" }, { "name": "deliverability" }]
+}

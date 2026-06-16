@@ -69,6 +69,26 @@ A healthy domain/campaign should hit **≥1% reply rate after 200 emails sent**.
 - Monthly hygiene check
 - Taking over someone else's Smartlead account
 
+## PDF guide
+
+Download: [docs/play-guide.pdf](docs/play-guide.pdf) — setup, commands, 1% rule, when to run.
+
+Regenerate: `python3 ../gtm-portfolio/tools/generate_play_pdfs.py`
+
+## n8n workflow
+
+Import `n8n/weekly-deliverability-audit.json` into n8n.
+
+| Node | What |
+|------|------|
+| Cron Monday 9am | Triggers weekly |
+| Fetch Smartlead inboxes | Fleet health |
+| Google DNS API | SPF + DMARC per domain |
+| Campaign analytics | 1% reply rule check |
+| Slack | Posts summary to `#gtm-alerts` |
+
+**Env vars:** `SMARTLEAD_API_KEY`, `SLACK_DELIVERABILITY_CHANNEL`
+
 ## Pair with
 
 - [gtm-list-quality-scorecard](https://github.com/rasulshaikh/gtm-list-quality-scorecard) — grade lists before sending
